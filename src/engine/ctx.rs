@@ -124,6 +124,8 @@ pub struct EngineCtx {
     pub preexisting_colors_present: bool,
     /// When Some, every event emission appends a trace line (test harness).
     pub event_log: Option<Vec<String>>,
+    /// Dropped last, after the terminal has released its visual handles.
+    _session: crate::engine::animation::VisualSession,
 }
 
 impl EngineCtx {
@@ -133,7 +135,14 @@ impl EngineCtx {
         rng: Rng,
         clock: Clock,
     ) -> Result<Self, EngineError> {
-        let terminal = Terminal::new(input_data, config)?;
+        let session = crate::engine::animation::VisualSession::enter();
+        let terminal = match Terminal::new(input_data, config) {
+            Ok(terminal) => terminal,
+            Err(err) => {
+                drop(session);
+                return Err(err);
+            }
+        };
         let preexisting_colors_present = terminal.input_characters.iter().any(|&id| {
             let ch = &terminal.arena[id.0 as usize];
             ch.animation.input_fg_color.is_some() || ch.animation.input_bg_color.is_some()
@@ -146,6 +155,7 @@ impl EngineCtx {
             active_character_scratch: Vec::new(),
             preexisting_colors_present,
             event_log: None,
+            _session: session,
         })
     }
 

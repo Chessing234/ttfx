@@ -133,15 +133,68 @@ type AppearanceMemo = Vec<Option<(ColorPair, u8, Visual)>>;
 
 type VisualPool = std::collections::HashSet<Visual, crate::utils::hash::FxBuild>;
 
-/// A pooled, immutable visual. Pooled visuals live for the rest of the process
-/// (the pool holds one per distinct appearance), so handles are plain `Copy`
-/// references: no refcount traffic, and pointer equality is byte equality.
+/// A pooled, immutable visual. While an [`crate::engine::ctx::EngineCtx`] is
+/// alive the pool holds one of each distinct appearance, so handles are plain
+/// `Copy` references: no refcount traffic, and pointer equality is byte
+/// equality. The last context to end on this thread frees the pool.
 pub type Visual = &'static CharacterVisual;
 
 thread_local! {
     /// Every visual built this run, deduplicated.
     static VISUAL_POOL: std::cell::RefCell<VisualPool> = std::cell::RefCell::new(VisualPool::default());
     static APPEARANCE_MEMO: std::cell::RefCell<AppearanceMemo> = std::cell::RefCell::new(vec![None; 4096]);
+    /// Live [`EngineCtx`] sessions. The pool is process-lifetime only while one
+    /// is alive; the last session to end frees it. A host that builds a new
+    /// effect every cycle (a screensaver) would otherwise keep every appearance
+    /// from every cycle.
+    static VISUAL_SESSIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Held by [`crate::engine::ctx::EngineCtx`] and dropped after the terminal, so
+/// the pool is freed only once that context's visuals are gone.
+pub(crate) struct VisualSession;
+
+impl VisualSession {
+    pub(crate) fn enter() -> Self {
+        VISUAL_SESSIONS.with(|n| n.set(n.get() + 1));
+        VisualSession
+    }
+}
+
+impl Drop for VisualSession {
+    fn drop(&mut self) {
+        VISUAL_SESSIONS.with(|n| {
+            let left = n.get().saturating_sub(1);
+            n.set(left);
+            if left == 0 {
+                release_interned_visuals();
+            }
+        });
+    }
+}
+
+fn release_interned_visuals() {
+    APPEARANCE_MEMO.with(|memo| {
+        for slot in memo.borrow_mut().iter_mut() {
+            *slot = None;
+        }
+    });
+    let old = VISUAL_POOL.with(|pool| std::mem::take(&mut *pool.borrow_mut()));
+    for visual in old {
+        // SAFETY: each pool entry was `Box::leak`'d in `interned`, and this
+        // runs only after every EngineCtx on this thread has dropped, so no
+        // visual pointer is still stored.
+        unsafe {
+            drop(Box::from_raw(
+                visual as *const CharacterVisual as *mut CharacterVisual,
+            ));
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn interned_visual_count() -> usize {
+    VISUAL_POOL.with(|pool| pool.borrow().len())
 }
 
 /// animation.CharacterVisual with the formatted ANSI string precomputed.
@@ -820,5 +873,70 @@ impl Animation {
             round_half_even(green * 255.0) as u8,
             round_half_even(blue * 255.0) as u8,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::ctx::{Clock, EngineCtx};
+    use crate::engine::terminal::TerminalConfig;
+    use crate::utils::graphics::{Color, ColorPair};
+    use crate::utils::rng::Rng;
+
+    fn intern_distinct(n: u8) -> Visual {
+        CharacterVisual::interned(
+            format!("cell{n}"),
+            VisualParams {
+                colors: Some(ColorPair::new(Some(Color::from_xterm(n)), None)),
+                ..VisualParams::default()
+            },
+        )
+    }
+
+    #[test]
+    fn last_session_releases_interned_visuals() {
+        let first = VisualSession::enter();
+        let overlapping = VisualSession::enter();
+        {
+            let kept = intern_distinct(1);
+            let again = intern_distinct(1);
+            assert!(std::ptr::eq(kept, again));
+            assert!(interned_visual_count() >= 1);
+        }
+        drop(first);
+        assert!(
+            interned_visual_count() >= 1,
+            "a live session keeps the pool"
+        );
+        drop(overlapping);
+        assert_eq!(interned_visual_count(), 0);
+        intern_distinct(2);
+        assert_eq!(interned_visual_count(), 1);
+        // Nothing owns that visual. A session open and closed frees it, which
+        // is also what a context does when it is the last one.
+        drop(VisualSession::enter());
+        assert_eq!(interned_visual_count(), 0);
+    }
+
+    #[test]
+    fn engine_context_releases_its_visuals() {
+        let config = TerminalConfig {
+            canvas_width: 20,
+            canvas_height: 8,
+            ignore_terminal_dimensions: true,
+            frame_rate: 0,
+            ..TerminalConfig::default()
+        };
+        let ctx = EngineCtx::new(
+            "ttfx ttfx\n",
+            config,
+            Rng::seeded(1),
+            Clock::virtual_with_frame_rate(60),
+        )
+        .unwrap();
+        assert!(interned_visual_count() > 0);
+        drop(ctx);
+        assert_eq!(interned_visual_count(), 0);
     }
 }
